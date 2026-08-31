@@ -126,3 +126,4 @@ def test_can_delete_task(client, dynamodb_table):
 
     get_response = client.get(f"/get-task/{task_id}")
     assert get_response.status_code == 404
+
