@@ -1,84 +1,128 @@
+import os
 from uuid import uuid4
-import requests
+
+import boto3
+import pytest
+from fastapi.testclient import TestClient
+from moto import mock_aws
+
+from api.todo import app
+
+TABLE_NAME = "todo-tasks"
 
 
-ENDPOINT = "https://67mtb3ab2k2rxf4o3xohyy7mfu0cfjho.lambda-url.ap-southeast-2.on.aws"
+@pytest.fixture
+def dynamodb_table():
+    with mock_aws():
+        os.environ["TABLE_NAME"] = TABLE_NAME
+        os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
+        os.environ["AWS_ACCESS_KEY_ID"] = "testing"
+        os.environ["AWS_SECRET_ACCESS_KEY"] = "testing"
+
+        dynamodb = boto3.resource("dynamodb", region_name="us-east-1")
+        table = dynamodb.create_table(
+            TableName=TABLE_NAME,
+            KeySchema=[{"AttributeName": "task_id", "KeyType": "HASH"}],
+            AttributeDefinitions=[
+                {"AttributeName": "task_id", "AttributeType": "S"},
+                {"AttributeName": "user_id", "AttributeType": "S"},
+            ],
+            GlobalSecondaryIndexes=[
+                {
+                    "IndexName": "user-index",
+                    "KeySchema": [{"AttributeName": "user_id", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"},
+                    "ProvisionedThroughput": {
+                        "ReadCapacityUnits": 5,
+                        "WriteCapacityUnits": 5,
+                    },
+                }
+            ],
+            ProvisionedThroughput={"ReadCapacityUnits": 5, "WriteCapacityUnits": 5},
+        )
+        yield table
 
 
-def test_can_put_and_get_task():
+@pytest.fixture
+def client(dynamodb_table):
+    with TestClient(app) as test_client:
+        yield test_client
+
+
+def test_can_put_and_get_task(client, dynamodb_table):
     user_id = f"user_{uuid4().hex}"
-    random_task_content = f"task content: {uuid4().hex}"
-    create_response = create_task(user_id, random_task_content)
+    content = f"task content: {uuid4().hex}"
+
+    create_response = client.put(
+        "/create-task",
+        json={"user_id": user_id, "content": content},
+    )
     assert create_response.status_code == 200
+    task = create_response.json()["task"]
+    task_id = task["task_id"]
 
-    task_id = create_response.json()["task"]["task_id"]
-    get_task_response = get_task(task_id)
-    assert get_task_response.status_code == 200
-    print(get_task_response)
-    assert get_task_response.json()["content"] == random_task_content
+    stored = dynamodb_table.get_item(Key={"task_id": task_id}).get("Item")
+    assert stored is not None
+    assert stored["content"] == content
+    assert stored["user_id"] == user_id
+
+    get_response = client.get(f"/get-task/{task_id}")
+    assert get_response.status_code == 200
+    assert get_response.json()["content"] == content
 
 
-def test_can_list_tasks():
+def test_can_list_tasks(client):
     user_id = f"user_{uuid4().hex}"
-
     for i in range(3):
-        create_task(user_id, f"task_{i}")
+        create_response = client.put(
+            "/create-task",
+            json={"user_id": user_id, "content": f"task_{i}"},
+        )
+        assert create_response.status_code == 200
 
-    response = list_tasks(user_id)
-    tasks = response.json()["tasks"]
-    assert len(tasks) == 3
+    response = client.get(f"/list-tasks/{user_id}")
+    assert response.status_code == 200
+    assert len(response.json()["tasks"]) == 3
 
 
-def test_can_update_task():
+def test_can_update_task(client, dynamodb_table):
     user_id = f"user_{uuid4().hex}"
-    create_response = create_task(user_id, "task content")
+    create_response = client.put(
+        "/create-task",
+        json={"user_id": user_id, "content": "task content"},
+    )
+    task_id = create_response.json()["task"]["task_id"]
+    new_content = f"updated task content: {uuid4().hex}"
+
+    update_response = client.put(
+        "/update-task",
+        json={"content": new_content, "task_id": task_id, "is_done": True},
+    )
+    assert update_response.status_code == 200
+
+    stored = dynamodb_table.get_item(Key={"task_id": task_id}).get("Item")
+    assert stored["content"] == new_content
+    assert stored["is_done"] is True
+
+    get_response = client.get(f"/get-task/{task_id}")
+    assert get_response.status_code == 200
+    assert get_response.json()["content"] == new_content
+    assert get_response.json()["is_done"] is True
+
+
+def test_can_delete_task(client, dynamodb_table):
+    user_id = f"user_{uuid4().hex}"
+    create_response = client.put(
+        "/create-task",
+        json={"user_id": user_id, "content": "task1"},
+    )
     task_id = create_response.json()["task"]["task_id"]
 
-    new_task_content = f"updated task content: {uuid4().hex}"
-    payload = {
-        "content": new_task_content,
-        "task_id": task_id,
-        "is_done": True,
-    }
-    update_task_response = update_task(payload)
-    assert update_task_response.status_code == 200
+    delete_response = client.delete(f"/delete-task/{task_id}")
+    assert delete_response.status_code == 200
 
-    get_task_response = get_task(task_id)
-    assert get_task_response.status_code == 200
-    assert get_task_response.json()["content"] == new_task_content
-    assert get_task_response.json()["is_done"] == True
+    stored = dynamodb_table.get_item(Key={"task_id": task_id}).get("Item")
+    assert stored is None
 
-
-def test_can_delete_task():
-    user_id = f"user_{uuid4().hex}"
-    create_response = create_task(user_id, "task1")
-    task_id = create_response.json()["task"]["task_id"]
-
-    delete_task(task_id)
-
-    get_task_response = get_task(task_id)
-    assert get_task_response.status_code == 404
-
-
-def list_tasks(user_id: str) -> dict:
-    return requests.get(f"{ENDPOINT}/list-tasks/{user_id}")
-
-
-def create_task(user_id: str, content: str) -> dict:
-    payload = {
-        "user_id": user_id,
-        "content": content,
-    }
-    return requests.put(f"{ENDPOINT}/create-task", json=payload)
-
-
-def get_task(task_id: str) -> dict:
-    return requests.get(f"{ENDPOINT}/get-task/{task_id}")
-
-
-def delete_task(task_id: str) -> dict:
-    return requests.delete(f"{ENDPOINT}/delete-task/{task_id}")
-
-
-def update_task(payload: dict) -> dict:
-    return requests.put(f"{ENDPOINT}/update-task", json=payload)
+    get_response = client.get(f"/get-task/{task_id}")
+    assert get_response.status_code == 404
