@@ -2,5 +2,6 @@ fastapi
 uvicorn
 mangum
 boto3
-requests
+httpx
 pytest
+moto
